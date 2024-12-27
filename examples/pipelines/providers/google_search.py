@@ -16,7 +16,7 @@ import json
 from pydantic import BaseModel, Field
 
 import google.generativeai as genai
-from google.generativeai.types import GenerationConfig, Tool, GoogleSearch, FunctionDeclaration
+from google.generativeai.types import GenerationConfig, Tool, FunctionDeclaration
 
 
 class Pipeline:
@@ -38,33 +38,38 @@ class Pipeline:
             "USE_PERMISSIVE_SAFETY": False
         })
         self.pipelines = []
-
-        genai.configure(api_key=self.valves.GOOGLE_API_KEY)
-        self.update_pipelines()
-
         self.google_search_tool = Tool(
-            function_declarations=[
-                FunctionDeclaration(
-                    name="google_search",
-                    description="Performs a google search and retrieves the results.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "The search query"}
-                        },
-                        "required": ["query"]
-                    }
-                )
-            ]
-        )
+                function_declarations=[
+                    FunctionDeclaration(
+                        name="google_search",
+                        description="Performs a google search and retrieves the results.",
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "The search query"}
+                            },
+                            "required": ["query"]
+                        }
+                    )
+                ]
+            )
+        try:
+            genai.configure(api_key=self.valves.GOOGLE_API_KEY)
+            self.update_pipelines()
+            print("Pipeline initialized successfully.")
+        except Exception as e:
+            print(f"Error during pipeline initialization: {e}")
 
 
     async def on_startup(self) -> None:
         """This function is called when the server is started."""
 
         print(f"on_startup:{__name__}")
-        genai.configure(api_key=self.valves.GOOGLE_API_KEY)
-        self.update_pipelines()
+        try:
+            genai.configure(api_key=self.valves.GOOGLE_API_KEY)
+            self.update_pipelines()
+        except Exception as e:
+            print(f"Error during on_startup: {e}")
 
     async def on_shutdown(self) -> None:
         """This function is called when the server is stopped."""
@@ -75,8 +80,12 @@ class Pipeline:
         """This function is called when the valves are updated."""
 
         print(f"on_valves_updated:{__name__}")
-        genai.configure(api_key=self.valves.GOOGLE_API_KEY)
-        self.update_pipelines()
+        try:
+            genai.configure(api_key=self.valves.GOOGLE_API_KEY)
+            self.update_pipelines()
+        except Exception as e:
+            print(f"Error during on_valves_updated: {e}")
+
 
     def update_pipelines(self) -> None:
         """Update the available models from Google GenAI"""
@@ -86,14 +95,15 @@ class Pipeline:
                 models = genai.list_models()
                 self.pipelines = [
                     {
-                        "id": model.name[7:],  # the "models/" part messes up the URL
+                        "id": model.name[7:],
                         "name": model.display_name,
                     }
                     for model in models
                     if "generateContent" in model.supported_generation_methods
                     if model.name[:7] == "models/"
                 ]
-            except Exception:
+            except Exception as e:
+                print(f"Error updating pipelines: {e}")
                 self.pipelines = [
                     {
                         "id": "error",
@@ -123,7 +133,7 @@ class Pipeline:
             print(f"Stream mode: {body.get('stream', False)}")
 
             system_message = next((msg["content"] for msg in messages if msg["role"] == "system"), None)
-            
+
             contents = []
             for message in messages:
                 if message["role"] != "system":
@@ -141,25 +151,24 @@ class Pipeline:
                                     parts.append({"image_url": image_url})
                         contents.append({"role": message["role"], "parts": parts})
                     elif message.get("function_call"):
-                            contents.append({
-                                "role": message["role"],
-                                "parts": [{
-                                    "function_call": message["function_call"]
-                                }]
-                                })
+                        contents.append({
+                            "role": message["role"],
+                            "parts": [{
+                                "function_call": message["function_call"]
+                            }]
+                        })
                     else:
                         contents.append({
                             "role": "user" if message["role"] == "user" else "model",
                             "parts": [{"text": message["content"]}]
                         })
-            
+
             if "gemini-1.5" in model_id:
-                model = genai.GenerativeModel(model_name=model_id, system_instruction=system_message, tools = [self.google_search_tool])
+                model = genai.GenerativeModel(model_name=model_id, system_instruction=system_message, tools=[self.google_search_tool])
             else:
                 if system_message:
-                    contents.insert(0, {"role": "user", "parts": [{"text": f"System: {system_message}"}]})
-                
-                model = genai.GenerativeModel(model_name=model_id, tools = [self.google_search_tool])
+                   contents.insert(0, {"role": "user", "parts": [{"text": f"System: {system_message}"}]})
+                model = genai.GenerativeModel(model_name=model_id, tools=[self.google_search_tool])
 
             generation_config = GenerationConfig(
                 temperature=body.get("temperature", 0.7),
@@ -178,51 +187,55 @@ class Pipeline:
                 }
             else:
                 safety_settings = body.get("safety_settings")
-
+            
             response = model.generate_content(
                 contents,
                 generation_config=generation_config,
                 safety_settings=safety_settings,
                 stream=body.get("stream", False),
             )
-            
-            if response.candidates[0].content.parts[0].function_call:
-                
+
+            if response.candidates and response.candidates[0].content.parts and response.candidates[0].content.parts[0].function_call:
                 function_call = response.candidates[0].content.parts[0].function_call
-                
                 function_name = function_call.name
                 function_parameters = json.loads(function_call.args)
 
                 if function_name == "google_search":
                     query = function_parameters["query"]
                     
-                    search_response = client.models.generate_content(
-                        model=model_id,
-                        contents = query,
-                         config =  GenerateContentConfig(
-                            tools=[Tool(google_search = GoogleSearch())],
-                            response_modalities=["TEXT"],
-                        )
-                    )
+                    search_contents = contents + [{
+                                "role": "user",
+                                "parts": [{
+                                    "text": query
+                                }]
+                            }]
                     
+                    search_response = model.generate_content(
+                        search_contents,
+                        generation_config=generation_config,
+                        safety_settings=safety_settings,
+                        stream=body.get("stream", False),
+                    )
+
                     search_results = ""
-                    for part in search_response.candidates[0].content.parts:
-                        search_results = search_results + part.text
+                    if search_response.candidates and search_response.candidates[0].content.parts:
+                        for part in search_response.candidates[0].content.parts:
+                            search_results += part.text
 
                     contents.append({
-                                "role": "function",
-                                "parts": [{
-                                    "text": search_results
-                                }]
-                                })
-                                    
+                        "role": "function",
+                        "parts": [{
+                            "text": search_results
+                        }]
+                    })
+
                     response = model.generate_content(
                         contents,
                         generation_config=generation_config,
                         safety_settings=safety_settings,
                         stream=body.get("stream", False),
                     )
-            
+
             if body.get("stream", False):
                 return self.stream_response(response)
             else:
@@ -230,7 +243,7 @@ class Pipeline:
 
         except Exception as e:
             print(f"Error generating content: {e}")
-            return f"An error occurred: {str(e)}"
+            return f"An error occurred: {str(e)}")
 
     def stream_response(self, response):
         for chunk in response:
